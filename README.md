@@ -1,8 +1,8 @@
-# EU VAT Number for WooCommerce
+# WordPress EU VAT
 
 ## Description
 
-EU VAT Number for WooCommerce is a plugin that helps online store owners comply with EU VAT regulations. It collects and validates VAT numbers at checkout, removes VAT charges for eligible EU businesses, and handles EU tax requirements for digital goods.
+WordPress EU VAT is a plugin that helps online store owners comply with EU VAT regulations. It collects and validates VAT numbers at checkout, removes VAT charges for eligible EU businesses, and handles EU tax requirements for digital goods.
 
 ## Features
 
@@ -57,7 +57,7 @@ For support, feature requests, or bug reports, please open an issue on the plugi
 
 ## Contributing
 
-Contributions to improve EU VAT Number for WooCommerce are welcome. Please feel free to submit pull requests or open issues on GitHub.
+Contributions to improve WordPress EU VAT are welcome. Please feel free to submit pull requests or open issues on GitHub.
 
 ## License
 
