@@ -4,21 +4,30 @@
  * Plugin Name: WordPress EU VAT
  * Plugin URI: https://github.com/Open-WP-Club/WP-eu-vat
  * Description: Collect VAT numbers at checkout and remove the VAT charge for eligible EU businesses.
- * Version: 0.0.1
+ * Version: 1.0.0
  * Author: Open WP Club
  * Author URI: https://openwpclub.com
  * License: GPL-2.0 License
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: wp-eu-vat
+ * Domain Path: /languages
  * Requires Plugins: woocommerce
  * Requires at least: 6.4
  * Requires PHP: 7.4
- * WC requires at least: 6.0
- * WC tested up to: 9.2.1
+ * WC requires at least: 8.0
+ * WC tested up to: 9.4
  */
-
 
 if (!defined('ABSPATH')) {
   exit; // Exit if accessed directly
 }
+
+// Declare HPOS compatibility
+add_action('before_woocommerce_init', function () {
+  if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+    \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+  }
+});
 
 class EU_VAT_Number_WooCommerce
 {
@@ -28,6 +37,15 @@ class EU_VAT_Number_WooCommerce
   public function __construct()
   {
     add_action('woocommerce_init', array($this, 'init'));
+    add_action('init', array($this, 'load_textdomain'));
+  }
+
+  /**
+   * Load plugin text domain for translations
+   */
+  public function load_textdomain()
+  {
+    load_plugin_textdomain('wp-eu-vat', false, dirname(plugin_basename(__FILE__)) . '/languages');
   }
 
   public function init()
@@ -39,6 +57,10 @@ class EU_VAT_Number_WooCommerce
     add_filter('woocommerce_customer_get_billing_country', array($this, 'validate_user_location'), 10, 2);
     add_action('woocommerce_checkout_update_order_review', array($this, 'handle_digital_goods_tax'));
     add_action('woocommerce_after_checkout_validation', array($this, 'validate_location'), 10, 2);
+
+    // Admin settings
+    add_filter('woocommerce_get_settings_tax', array($this, 'add_vat_settings'), 10, 2);
+    add_action('admin_init', array($this, 'register_clear_cache_action'));
   }
 
   public function add_vat_number_field($checkout)
@@ -46,32 +68,45 @@ class EU_VAT_Number_WooCommerce
     woocommerce_form_field('vat_number', array(
       'type' => 'text',
       'class' => array('form-row-wide'),
-      'label' => __('VAT Number', 'eu-vat-number-woo'),
-      'placeholder' => __('Enter VAT Number', 'eu-vat-number-woo'),
+      'label' => __('VAT Number', 'wp-eu-vat'),
+      'placeholder' => __('Enter VAT Number', 'wp-eu-vat'),
     ), $checkout->get_value('vat_number'));
   }
 
   public function validate_vat_number()
   {
+    // phpcs:ignore WordPress.Security.NonceVerification.Missing -- WooCommerce checkout handles nonce verification
     if (!empty($_POST['vat_number'])) {
-      $vat_number = sanitize_text_field($_POST['vat_number']);
+      $vat_number = sanitize_text_field(wp_unslash($_POST['vat_number']));
       if (!$this->is_valid_vat_number($vat_number)) {
-        wc_add_notice(__('Invalid VAT number. Please check and try again.', 'eu-vat-number-woo'), 'error');
+        wc_add_notice(__('Invalid VAT number. Please check and try again.', 'wp-eu-vat'), 'error');
       }
     }
   }
 
   public function save_vat_number($order_id)
   {
+    // phpcs:ignore WordPress.Security.NonceVerification.Missing -- WooCommerce checkout handles nonce verification
     if (!empty($_POST['vat_number'])) {
-      update_post_meta($order_id, '_vat_number', sanitize_text_field($_POST['vat_number']));
+      $vat_number = sanitize_text_field(wp_unslash($_POST['vat_number']));
+      $order = wc_get_order($order_id);
+
+      if ($order) {
+        // HPOS compatible way to save order meta
+        $order->update_meta_data('_vat_number', $vat_number);
+        $order->save();
+      }
     }
   }
 
   public function maybe_exempt_vat($taxes, $price, $rates, $price_includes_tax, $suppress_rounding)
   {
-    if (!empty($_POST['vat_number']) && $this->is_valid_vat_number($_POST['vat_number'])) {
-      return array(); // Return empty array to remove VAT
+    // phpcs:ignore WordPress.Security.NonceVerification.Missing -- WooCommerce checkout handles nonce verification
+    if (!empty($_POST['vat_number'])) {
+      $vat_number = sanitize_text_field(wp_unslash($_POST['vat_number']));
+      if ($this->is_valid_vat_number($vat_number)) {
+        return array(); // Return empty array to remove VAT
+      }
     }
     return $taxes;
   }
@@ -81,7 +116,7 @@ class EU_VAT_Number_WooCommerce
     $geolocated_country = $this->get_user_country_by_ip();
 
     if ($geolocated_country && $geolocated_country !== $country) {
-      wc_add_notice(__('Your billing country does not match your detected location. Please update your billing information or confirm your location.', 'eu-vat-number-woo'), 'notice');
+      wc_add_notice(__('Your billing country does not match your detected location. Please update your billing information or confirm your location.', 'wp-eu-vat'), 'notice');
     }
 
     return $country; // Return the original country to avoid overriding user input
@@ -172,9 +207,67 @@ class EU_VAT_Number_WooCommerce
 
   private function validate_vat_with_service($country_code, $vat_number)
   {
-    // In a real-world scenario, you would make an API call to a VAT validation service here
-    // For this example, we'll just return true
-    return true;
+    // Check if VIES validation is enabled
+    $vies_enabled = get_option('eu_vat_enable_vies', 'yes') === 'yes';
+
+    if (!$vies_enabled) {
+      // VIES validation is disabled, rely on format validation only
+      return true;
+    }
+
+    // Check cache first
+    $cache_key = 'vat_validation_' . md5($country_code . $vat_number);
+    $cached_result = get_transient($cache_key);
+
+    if ($cached_result !== false) {
+      return $cached_result === 'valid';
+    }
+
+    try {
+      // VIES SOAP endpoint
+      $wsdl = 'https://ec.europa.eu/taxation_customs/vies/checkVatService.wsdl';
+
+      // Check if SOAP extension is available
+      if (!class_exists('SoapClient')) {
+        error_log('WP EU VAT: SOAP extension not available. Falling back to format validation only.');
+        return true; // Fallback to format validation
+      }
+
+      $client = new SoapClient($wsdl, array(
+        'connection_timeout' => 10,
+        'exceptions' => true,
+        'cache_wsdl' => WSDL_CACHE_BOTH
+      ));
+
+      $params = array(
+        'countryCode' => $country_code,
+        'vatNumber' => $vat_number
+      );
+
+      $response = $client->checkVat($params);
+
+      // Get cache duration from settings (in hours)
+      $cache_duration = absint(get_option('eu_vat_cache_duration', 24));
+      $cache_duration_seconds = $cache_duration * HOUR_IN_SECONDS;
+
+      // Cache the result
+      $is_valid = isset($response->valid) && $response->valid === true;
+      set_transient($cache_key, $is_valid ? 'valid' : 'invalid', $cache_duration_seconds);
+
+      return $is_valid;
+
+    } catch (SoapFault $e) {
+      // Log the error
+      error_log('WP EU VAT: VIES validation error - ' . $e->getMessage());
+
+      // If VIES service is unavailable, fallback to format validation
+      // This prevents blocking legitimate transactions when the service is down
+      return true;
+
+    } catch (Exception $e) {
+      error_log('WP EU VAT: Unexpected error during VAT validation - ' . $e->getMessage());
+      return true; // Fallback to format validation
+    }
   }
 
   private function get_user_country_by_ip()
@@ -234,8 +327,134 @@ class EU_VAT_Number_WooCommerce
     $ip_country = $this->get_user_country_by_ip();
 
     if ($ip_country && $billing_country !== $ip_country) {
-      $errors->add('validation', __('Your billing country does not match your detected location. Please verify your information or confirm your location.', 'eu-vat-number-woo'));
+      $errors->add('validation', __('Your billing country does not match your detected location. Please verify your information or confirm your location.', 'wp-eu-vat'));
     }
+  }
+
+  /**
+   * Add VAT settings to WooCommerce Tax settings
+   */
+  public function add_vat_settings($settings, $current_section)
+  {
+    if ($current_section === '') {
+      $vat_settings = array(
+        array(
+          'title' => __('EU VAT Validation', 'wp-eu-vat'),
+          'type' => 'title',
+          'desc' => __('Configure EU VAT number validation settings', 'wp-eu-vat'),
+          'id' => 'eu_vat_validation_options'
+        ),
+        array(
+          'title' => __('Enable VIES Validation', 'wp-eu-vat'),
+          'desc' => __('Validate VAT numbers against the European VIES system in real-time', 'wp-eu-vat'),
+          'id' => 'eu_vat_enable_vies',
+          'default' => 'yes',
+          'type' => 'checkbox'
+        ),
+        array(
+          'title' => __('Cache Duration', 'wp-eu-vat'),
+          'desc' => __('How long to cache validation results (in hours)', 'wp-eu-vat'),
+          'id' => 'eu_vat_cache_duration',
+          'default' => '24',
+          'type' => 'number',
+          'custom_attributes' => array(
+            'min' => '1',
+            'max' => '168'
+          )
+        ),
+        array(
+          'title' => __('Clear VAT Cache', 'wp-eu-vat'),
+          'desc' => __('Clear all cached VAT validation results', 'wp-eu-vat'),
+          'id' => 'eu_vat_clear_cache',
+          'type' => 'button',
+          'desc_tip' => true,
+        ),
+        array(
+          'type' => 'sectionend',
+          'id' => 'eu_vat_validation_options'
+        )
+      );
+
+      // Insert VAT settings after the standard options
+      $settings = array_merge($settings, $vat_settings);
+    }
+
+    return $settings;
+  }
+
+  /**
+   * Register clear cache action handler
+   */
+  public function register_clear_cache_action()
+  {
+    // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Nonce verification happens below
+    if (isset($_GET['clear_vat_cache']) && current_user_can('manage_woocommerce')) {
+      check_admin_referer('clear_vat_cache');
+      $this->clear_vat_cache();
+      wp_redirect(admin_url('admin.php?page=wc-settings&tab=tax&cache_cleared=1'));
+      exit;
+    }
+
+    // Show admin notice after clearing cache
+    // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only, no action performed
+    if (isset($_GET['cache_cleared']) && '1' === $_GET['cache_cleared']) {
+      add_action('admin_notices', function () {
+        echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__('VAT validation cache has been cleared.', 'wp-eu-vat') . '</p></div>';
+      });
+    }
+
+    // Add clear cache button functionality
+    add_action('woocommerce_admin_field_button', array($this, 'render_clear_cache_button'));
+  }
+
+  /**
+   * Render clear cache button in WooCommerce settings
+   */
+  public function render_clear_cache_button($value)
+  {
+    if ('eu_vat_clear_cache' !== $value['id']) {
+      return;
+    }
+
+    $clear_url = wp_nonce_url(
+      admin_url('admin.php?page=wc-settings&tab=tax&clear_vat_cache=1'),
+      'clear_vat_cache'
+    );
+    ?>
+    <tr valign="top">
+      <th scope="row" class="titledesc">
+        <label for="<?php echo esc_attr($value['id']); ?>"><?php echo esc_html($value['title']); ?></label>
+      </th>
+      <td class="forminp forminp-<?php echo esc_attr(sanitize_title($value['type'])); ?>">
+        <a href="<?php echo esc_url($clear_url); ?>" class="button button-secondary">
+          <?php esc_html_e('Clear Cache Now', 'wp-eu-vat'); ?>
+        </a>
+        <p class="description"><?php echo esc_html($value['desc']); ?></p>
+      </td>
+    </tr>
+    <?php
+  }
+
+  /**
+   * Clear all VAT validation cache
+   */
+  public function clear_vat_cache()
+  {
+    global $wpdb;
+
+    // Delete all transients that start with 'vat_validation_'
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $wpdb->query(
+      $wpdb->prepare(
+        "DELETE FROM {$wpdb->options}
+         WHERE option_name LIKE %s
+         OR option_name LIKE %s",
+        $wpdb->esc_like('_transient_vat_validation_') . '%',
+        $wpdb->esc_like('_transient_timeout_vat_validation_') . '%'
+      )
+    );
+
+    return true;
   }
 }
 
